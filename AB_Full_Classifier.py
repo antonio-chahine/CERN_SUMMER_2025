@@ -193,7 +193,8 @@ if args.run:
                     if not hit_group:
                         continue
                     _, _, pid = hit_group[0]
-                    p = functions.Particle(trackID=trackID, cellID=None, pid=pid)
+                    p = functions.Particle(trackID=trackID)
+                    p.pid = pid
                     for _, h, _ in hit_group:
                         p.add_hit(h)
                         
