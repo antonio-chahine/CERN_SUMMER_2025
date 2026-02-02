@@ -502,3 +502,7 @@ if args.classify:
     filename="feature_importance",
     sort=True
 )
+    
+    import pickle
+    with open("results_classifierA.pkl", "wb") as f:
+        pickle.dump((y_test, y_proba), f)
