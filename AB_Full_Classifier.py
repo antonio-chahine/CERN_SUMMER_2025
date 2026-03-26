@@ -401,108 +401,137 @@ if args.classify:
     # === Feature extraction and split ===
     X, y = get_features_and_labels(sampled_signal, all_background)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # ---- add CLI args near the top (once) ----
+    # parser.add_argument("--n_seeds", type=int, default=10)
+    # parser.add_argument("--seed0", type=int, default=0)
 
-    clf = xgb.XGBClassifier(
-        use_label_encoder=False,
-        eval_metric='logloss',
-        n_estimators=100,
-        max_depth=8,
-        learning_rate=0.1,
-        scale_pos_weight=0.5,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42
-    )
-    clf.fit(X_train, y_train)
-    y_proba = clf.predict_proba(X_test)[:, 1]
-
-    # === Sweep thresholds to find one that preserves ≥99% signal
-    thresholds = np.linspace(0.0, 1.0, 500)
-    tpr_list, fpr_list, f1_list = [], [], []
-
-    for thresh in thresholds:
-        y_pred_temp = (y_proba >= thresh).astype(int)
-        TP = np.sum((y_pred_temp == 1) & (y_test == 1))
-        FP = np.sum((y_pred_temp == 1) & (y_test == 0))
-        FN = np.sum((y_pred_temp == 0) & (y_test == 1))
-        TN = np.sum((y_pred_temp == 0) & (y_test == 0))
-
-        tpr = TP / (TP + FN) if TP + FN > 0 else 0
-        fpr = FP / (FP + TN) if FP + TN > 0 else 0
-        precision, recall, f1, _ = precision_recall_fscore_support(y_test, y_pred_temp, average='binary', zero_division=0)
-
-        tpr_list.append(tpr)
-        fpr_list.append(fpr)
-        f1_list.append(f1)
-
-    target_tpr = 0.99
-    best_thresh, best_fpr = None, 1.0
-    for thresh, tpr, fpr in zip(thresholds, tpr_list, fpr_list):
-        if tpr >= target_tpr and fpr < best_fpr:
-            best_thresh, best_fpr = thresh, fpr
-
-    if best_thresh is not None:
-        print(f"Threshold for ≥{target_tpr*100:.1f}% signal retention: {best_thresh:.4f}")
-        print(f"Background rejection at that threshold: {1 - best_fpr:.4f}")
-    else:
-        print(f"No threshold found that satisfies TPR ≥ {target_tpr*100:.1f}%")
-
-    y_pred = (y_proba >= best_thresh).astype(int)
-
-    print("\n=== Final Classification Report ===")
-    print(classification_report(y_test, y_pred, target_names=["Background", "Signal"]))
-    print("Confusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
-    print("ROC AUC score: %.4f" % roc_auc_score(y_test, y_proba))
-
-    plt.plot(thresholds, tpr_list, label='TPR (Signal Retention)')
-    plt.plot(thresholds, fpr_list, label='FPR (Background Acceptance)')
-    if best_thresh is not None:
-        plt.axvline(best_thresh, color='g', linestyle='--', label=f'TPR ≥ {target_tpr*100:.0f}% @ {best_thresh:.3f}')
-    plt.xlabel("Threshold")
-    plt.ylabel("Metric Value")
-    plt.title("Threshold Sweep — TPR, FPR")
-    plt.legend(loc='best')
-    plt.grid(True)
-    plt.savefig(os.path.join(outdir, "threshold_sweep_metrics.png"))
-    plt.close()
-
-    fpr, tpr, _ = roc_curve(y_test, y_proba)
-    auc = roc_auc_score(y_test, y_proba)
-    plt.plot(fpr, tpr, label=f'ROC (AUC = {auc:.3f})')
-    plt.plot([0, 1], [0, 1], 'k--', alpha=0.5)
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("ROC Curve — Final XGBoost Classifier")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(outdir, "presentation_ROC_curve.png"))
-    plt.close()
-
-    ConfusionMatrixDisplay.from_predictions(
-        y_test, y_pred,
-        display_labels=["Background", "Signal"],
-        cmap="Blues",
-        values_format='d'
-    )
-    plt.title(f"Confusion Matrix @ Threshold = {best_thresh:.4f}")
-    plt.savefig(os.path.join(outdir, "presentation_confusion_matrix.png"))
-    plt.close()
-    
-    functions.plot_feature_importance(
-    clf.feature_importances_,
-    feature_names=[
-        r"$\log(\Delta z)$",
-        r"$\varphi$ extent",
-        r"multiplicity",
-        r"$\log(E_{\mathrm{dep}})$",
-        r"$\cos\theta$"
-    ],
-    outdir="Classification_AB",
-    filename="feature_importance",
-    sort=True
-)
-    
+    # ---- inside if args.classify: after you build X, y ----
+    import numpy as np
+    import random
     import pickle
-    with open("results_classifierA.pkl", "wb") as f:
-        pickle.dump((y_test, y_proba), f)
+    import os
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
+
+    def set_all_seeds(seed: int):
+        random.seed(seed)
+        np.random.seed(seed)
+
+    def find_best_thresholds(y_test, y_proba, thresholds, targets):
+        # returns dict: target -> dict(thresh, fpr, tpr)
+        out = {}
+        # Precompute TP/FP/FN/TN for each threshold cheaply
+        y_test = np.asarray(y_test).astype(int)
+        pos = (y_test == 1)
+        neg = (y_test == 0)
+        n_pos = pos.sum()
+        n_neg = neg.sum()
+
+        best_for_target = {t: {"thresh": None, "fpr": 1.0, "tpr": 0.0} for t in targets}
+
+        for thresh in thresholds:
+            y_pred = (y_proba >= thresh).astype(int)
+
+            TP = np.sum((y_pred == 1) & pos)
+            FP = np.sum((y_pred == 1) & neg)
+            FN = n_pos - TP
+            TN = n_neg - FP
+
+            tpr = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+            fpr = FP / (FP + TN) if (FP + TN) > 0 else 0.0
+
+            for target in targets:
+                cur = best_for_target[target]
+                if tpr >= target and fpr < cur["fpr"]:
+                    best_for_target[target] = {"thresh": float(thresh), "fpr": float(fpr), "tpr": float(tpr)}
+
+        return best_for_target
+
+    targets = [0.90, 0.99, 0.999]
+    thresholds = np.linspace(0.0, 1.0, 500)
+
+    results = {
+        "seed": [],
+        "auc": [],
+        # store per target
+        "ops": {t: {"thresh": [], "fpr": [], "tpr": [], "bkg_rej": []} for t in targets},
+    }
+
+    n_seeds = getattr(args, "n_seeds", 10)
+    seed0 = getattr(args, "seed0", 0)
+
+    for k in range(n_seeds):
+        seed = seed0 + k
+        set_all_seeds(seed)
+
+        # split changes with seed
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=seed, stratify=y
+        )
+
+        clf = xgb.XGBClassifier(
+            use_label_encoder=False,
+            eval_metric="logloss",
+            n_estimators=100,
+            max_depth=8,
+            learning_rate=0.1,
+            scale_pos_weight=0.5,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=seed,
+            n_jobs=4
+        )
+        clf.fit(X_train, y_train)
+
+        y_proba = clf.predict_proba(X_test)[:, 1]
+        auc = roc_auc_score(y_test, y_proba)
+
+        best = find_best_thresholds(y_test, y_proba, thresholds, targets)
+
+        results["seed"].append(seed)
+        results["auc"].append(float(auc))
+
+        print(f"\n[seed {seed}] AUC = {auc:.6f}")
+        for t in targets:
+            op = best[t]
+            if op["thresh"] is None:
+                print(f"  TPR ≥ {t*100:.1f}%: no threshold found")
+                # push NaNs so summary still works
+                results["ops"][t]["thresh"].append(np.nan)
+                results["ops"][t]["fpr"].append(np.nan)
+                results["ops"][t]["tpr"].append(np.nan)
+                results["ops"][t]["bkg_rej"].append(np.nan)
+            else:
+                bkg_rej = 1.0 - op["fpr"]
+                print(f"  TPR ≥ {t*100:.1f}%: thr={op['thresh']:.4f} | "
+                    f"TPR={op['tpr']:.4f} | FPR={op['fpr']:.4f} | bkg rej={bkg_rej:.4f}")
+                results["ops"][t]["thresh"].append(op["thresh"])
+                results["ops"][t]["fpr"].append(op["fpr"])
+                results["ops"][t]["tpr"].append(op["tpr"])
+                results["ops"][t]["bkg_rej"].append(bkg_rej)
+
+    # ---- summary ----
+    def mean_std(x):
+        x = np.asarray(x, dtype=float)
+        x = x[~np.isnan(x)]
+        if len(x) == 0:
+            return np.nan, np.nan
+        return float(x.mean()), float(x.std(ddof=1)) if len(x) > 1 else 0.0
+
+    auc_mean, auc_std = mean_std(results["auc"])
+    print("\n================ SUMMARY (mean ± std over seeds) ================")
+    print(f"AUC: {auc_mean:.6f} ± {auc_std:.6f}")
+
+    for t in targets:
+        thr_m, thr_s = mean_std(results["ops"][t]["thresh"])
+        fpr_m, fpr_s = mean_std(results["ops"][t]["fpr"])
+        rej_m, rej_s = mean_std(results["ops"][t]["bkg_rej"])
+        print(f"TPR ≥ {t*100:.1f}%:")
+        print(f"  thr:     {thr_m:.4f} ± {thr_s:.4f}")
+        print(f"  FPR:     {fpr_m:.4f} ± {fpr_s:.4f}")
+        print(f"  bkg rej: {rej_m:.4f} ± {rej_s:.4f}")
+
+    # ---- save per-seed operating points + AUC ----
+    with open(os.path.join(outdir, "seed_sweep_results.pkl"), "wb") as f:
+        pickle.dump(results, f)
+    print(f"\nSaved per-seed results to {os.path.join(outdir, 'seed_sweep_results.pkl')}")
